@@ -166,7 +166,7 @@ public class MainActivity extends BridgeActivity {
     }
 
     /**
-     * `intent://host/path#Intent;scheme=https;package=...;S.browser_fallback_url=...;end`
+     * intent://host/path#Intent;scheme=https;package=...;S.browser_fallback_url=...;end
      * resolves to the equivalent https URL so nothing leaves the WebView.
      */
     private static String resolveIntentUrl(String url) {
