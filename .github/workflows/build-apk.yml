@@ -135,6 +135,12 @@ jobs:
         if: ${{ env.MODE == 'remote' }}
         run: node scripts/patch-main-activity.mjs "$MODE"
 
+      - name: Install deterministic debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          cp "$GITHUB_WORKSPACE/android-keys/debug.keystore" "$HOME/.android/debug.keystore"
+          ls -l "$HOME/.android/debug.keystore"
+
       - name: Build debug APK
         run: |
           cd android
