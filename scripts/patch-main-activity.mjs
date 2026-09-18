@@ -112,14 +112,12 @@ public class MainActivity extends BridgeActivity {
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                return intercept(view, url)
-                        || (originalClient != null && originalClient.shouldOverrideUrlLoading(view, url));
+                return intercept(view, url);
             }
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return intercept(view, request.getUrl().toString())
-                        || (originalClient != null && originalClient.shouldOverrideUrlLoading(view, request));
+                return intercept(view, request.getUrl().toString());
             }
 
             private boolean intercept(WebView view, String url) {
