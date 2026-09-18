@@ -291,8 +291,14 @@ public class MainActivity extends BridgeActivity {
                         new android.webkit.ValueCallback<String>() {
                             @Override
                             public void onReceiveValue(String value) {
-                                boolean ok = value != null && value.trim().equals("true");
-                                android.util.Log.d("PenpotMobile", "touch shim attempt=" + attempt + " installed=" + ok + " raw=" + value);
+                                // evaluateJavascript JSON-encodes the result, so a JS
+                                // string result arrives as "\"true\"" (with quotes).
+                                String v = value;
+                                if (v != null && v.length() >= 2 && v.charAt(0) == '"' && v.charAt(v.length() - 1) == '"') {
+                                    v = v.substring(1, v.length() - 1);
+                                }
+                                boolean ok = "true".equals(v);
+                                android.util.Log.d("PenpotMobile", "touch shim attempt=" + attempt + " installed=" + ok);
                                 if (ok) {
                                     attempts[0] = 999; // stop the watchdog
                                 }
