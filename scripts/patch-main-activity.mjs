@@ -41,13 +41,19 @@ if (!existsSync(shimPath)) {
 
 const shim = readFileSync(shimPath, "utf8");
 
-// Java string literal escaping. Order matters: real newlines -> "\n" chars,
-// then backslashes (incl. the ones just introduced) and double quotes.
+// Java string literal escaping. Order matters: escape REAL backslashes first
+// (`\` -> `\\`) so the shim's own `'\n'` sequences survive as backslash-n in
+// the decoded string; THEN turn real newlines into `\n` (a single backslash-n
+// token, which Java decodes back into an actual newline char), and finally
+// double quotes. Escaping backslashes after the newline step would double-escape
+// the newline token into `\\n`, so the delivered JS would contain literal
+// `\n` sequences outside strings -> "Invalid or unexpected token" -> the whole
+// eval silently yields null and the shim never installs.
 const javaEscape = (s) =>
   s
+    .replace(/\\/g, "\\\\")
     .replace(/\r\n/g, "\n")
     .replace(/\n/g, "\\n")
-    .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"');
 
 // Escape the shim exactly once: real newlines -> "\n" chars, backslashes and
