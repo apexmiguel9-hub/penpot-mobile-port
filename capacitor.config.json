@@ -1,0 +1,8 @@
+{
+  "appId": "app.penpot.mobile",
+  "appName": "Penpot Mobile",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": true
+  }
+}

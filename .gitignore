@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Capacitor generates this platform folder on `npx cap add android`
+android/
+
+# Web bundle is reproduced from the Penpot build in CI (scripts/package-www.mjs)
+www/penpot-www/
+www/js/config.js
+
+# Local Java/Rust/cache artifacts
+*.log
+.gradle/
+local.properties
+
+# OS noise
+.DS_Store
+Thumbs.db

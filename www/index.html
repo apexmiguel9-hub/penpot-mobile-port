@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Penpot Mobile</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #1b1c20;
+        color: #e9e9e9;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100dvh;
+        gap: 16px;
+        padding: 24px;
+        text-align: center;
+      }
+      h1 { font-size: 20px; }
+      p { opacity: 0.75; max-width: 40ch; line-height: 1.5; }
+      code { background: #2a2c31; border-radius: 6px; padding: 2px 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Penpot Mobile (POC shell)</h1>
+    <p>
+      Este WebView carga Penpot desde la URL configurada en
+      <code>capacitor.config.json</code> (campo <code>server.url</code>).
+      Los gestos de doble dedo (pinch zoom + pan) se inyectan vía el shim
+      en despliegues sin parchar, o vía el módulo CLJS
+      <code>mobile_gestures.cljs</code> cuando usas el frontend parcheado.
+    </p>
+    <p>
+      Revisa <code>README.md</code> para los dos modos de uso.
+    </p>
+    <script src="./penpot-touch-shim.js"></script>
+  </body>
+</html>

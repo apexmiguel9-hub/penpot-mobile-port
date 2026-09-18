@@ -1,0 +1,64 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) KALEIDOS SUBSIDIARY SL
+
+// --------------------------------------------------------------------------
+// Coarse pointer (touch) support for the workspace viewport
+// --------------------------------------------------------------------------
+// Expands the invisible SVG hit targets of the selection gizmos so they are
+// comfortable to press with a finger. The 8px visual handles get a ~40px
+// invisible hit area by turning the (already invisible) touch rects/circles
+// into a transparent non-scaling stroke — the classic SVG hitbox trick that
+// keeps the area constant regardless of the canvas zoom.
+//
+// `vector-effect: non-scaling-stroke` guarantees the touch ring stays ~40px on
+// screen even when very zoomed out.
+
+@media (pointer: coarse) {
+  .viewport,
+  .viewport * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .viewport {
+    touch-action: none;
+  }
+
+  // Corner resize point handles (~6-8px visual).
+  .resize-handler > rect[data-position],
+  .resize-handler > circle[data-position] {
+    pointer-events: stroke;
+    stroke: transparent;
+    stroke-width: 24px;
+    vector-effect: non-scaling-stroke;
+  }
+
+  // Side resize handles (thin strips).
+  .resize-handler > rect:not([data-position]) {
+    pointer-events: stroke;
+    stroke: transparent;
+    stroke-width: 24px;
+    vector-effect: non-scaling-stroke;
+  }
+
+  // The selection outline / move body.
+  .viewport-selrect {
+    pointer-events: stroke;
+    stroke: transparent;
+    stroke-width: 24px;
+    vector-effect: non-scaling-stroke;
+  }
+
+  // The rotation handler already renders a 20px circle + connector; give it a
+  // little more room to grab.
+  .rotate-handler {
+    circle,
+    line {
+      stroke: transparent;
+      stroke-width: 24px;
+      vector-effect: non-scaling-stroke;
+    }
+  }
+}
