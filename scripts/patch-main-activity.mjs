@@ -49,7 +49,7 @@ const shimLiteral = javaEscape(shim);
 const bootstrap =
   "(function(){" +
   "var t=setInterval(function(){" +
-  'if(document.readyState==="complete"){clearInterval(t);' +
+  "if(document.readyState === 'complete'){clearInterval(t);" +
   `${shimLiteral}` +
   "}},500);" +
   "setTimeout(function(){clearInterval(t);},60000);" +
