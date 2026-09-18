@@ -1,0 +1,142 @@
+name: Build Penpot Mobile APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      backend_uri:
+        description: >-
+          Penpot backend the app talks to (baked into www/js/config.js via
+          window.penpotPublicURI). The backend must send CORS headers for the
+          WebView origin https://localhost (our self-hosted flag --allow-origin).
+        type: string
+        required: false
+        default: "https://design.penpot.app"
+      penpot_ref:
+        description: Penpot upstream commit to build (must match patches/PENPOT_COMMIT)
+        type: string
+        required: false
+        default: "fe89e9e52c1af7c80bfef7d389accb64d020328b"
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PENPOT_SHA: ${{ inputs.penpot_ref || 'fe89e9e52c1af7c80bfef7d389accb64d020328b' }}
+      BACKEND_URI: ${{ inputs.backend_uri || 'https://design.penpot.app' }}
+
+    steps:
+      # ── Toolchain setup ────────────────────────────────────────────────
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ── Pin Penpot source + apply the mobile-gesture patch ─────────────
+      - name: Fetch pinned Penpot commit
+        run: |
+          git init -q penpot
+          git -C penpot remote add origin https://github.com/penpot/penpot.git
+          git -C penpot fetch --depth 1 origin "$PENPOT_SHA"
+          git -C penpot -c advice.detachedHead=false checkout "$PENPOT_SHA"
+          echo "penpot source: $(git -C penpot rev-parse --short HEAD)"
+
+      - name: Apply mobile-gestures patch
+        run: ./patches/apply.sh penpot
+
+      # ── Build the Penpot frontend bundle ────────────────────────────────
+      # Upstream builds the bundle inside the `penpotapp/devenv` Docker image
+      # (Node 24/pnpm, JDK, Clojure CLI, Rust wasm32-emscripten, emsdk at
+      # /opt/emsdk, skia-binaries). We mirror exactly what `manage.sh build
+      # frontend` does (frontend/scripts/build inside the container). The
+      # /home/penpot bind keeps the pnpm/maven/cargo caches between runs via
+      # actions/cache. The resulting static bundle lands in
+      # penpot/frontend/target/dist.
+      - name: Cache devenv package/cargo caches
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/penpot-home
+          key: penpot-cache-${{ runner.os }}-${{ hashFiles('penpot/frontend/deps.edn', 'penpot/frontend/pnpm-lock.yaml', 'penpot/render-wasm/pnpm-lock.yaml', 'penpot/render-wasm/Cargo.lock') }}
+          restore-keys: |
+            penpot-cache-${{ runner.os }}-
+          save-always: true
+
+      - name: Pre-create devenv home for caches
+        run: mkdir -p "$RUNNER_TEMP/penpot-home"
+
+      - name: Build Penpot frontend (devenv)
+        run: |
+          docker run --rm \
+            --mount "source=${GITHUB_WORKSPACE}/penpot,type=bind,target=/home/penpot/penpot" \
+            --mount "source=${RUNNER_TEMP}/penpot-home,type=bind,target=/home/penpot" \
+            -e EXTERNAL_UID="$(id -u)" \
+            -e BUILD_WASM=yes \
+            -e JAVA_OPTS="-Xmx4096m" \
+            -w /home/penpot/penpot/frontend \
+            penpotapp/devenv:latest \
+            sudo -EH -u penpot ./scripts/build ci
+
+      - name: Verify frontend bundle
+        run: |
+          test -f penpot/frontend/target/dist/index.html || { echo "index.html missing"; exit 1; }
+          test -f penpot/frontend/target/dist/js/render-wasm.wasm || { echo "render-wasm.wasm missing"; exit 1; }
+          echo "bundle ok: $(du -sh penpot/frontend/target/dist | cut -f1)"
+
+      # ── Assemble the Capacitor web dir ──────────────────────────────────
+      - name: Package www from bundle + backend config
+        run: node scripts/package-www.mjs penpot/frontend/target/dist "$BACKEND_URI"
+
+      - name: Install Capacitor dependencies
+        run: npm install --no-audit --no-fund
+
+      # ── Android project + APK ───────────────────────────────────────────
+      - name: Add Android platform
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: penpot-mobile-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload web bundle (inspection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: penpot-www
+          path: www
+          retention-days: 7
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Penpot Mobile APK build"
+            echo ""
+            echo "- Penpot source: \`${{ env.PENPOT_SHA }}\`"
+            echo "- Backend URI : \`${{ env.BACKEND_URI }}\` (CORS for \`https://localhost\` required)"
+            echo "- Artifacts  : penpot-mobile-debug (APK), penpot-www (bundle)"
+          } >> "$GITHUB_STEP_SUMMARY"
