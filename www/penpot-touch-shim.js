@@ -26,6 +26,7 @@
 
   if (window.__penpotTouchShim) { return; }
   window.__penpotTouchShim = true;
+  console.log("[penpot-touch-shim] mobile gesture layer installed");
 
   if (typeof window.PointerEvent !== 'function') { return; }
 
