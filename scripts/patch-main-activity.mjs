@@ -123,11 +123,22 @@ public class MainActivity extends BridgeActivity {
             }
 
             private boolean intercept(WebView view, String url) {
-                if (url != null && url.startsWith("intent://")) {
-                    view.loadUrl(resolveIntentUrl(url));
+                android.util.Log.d("PenpotMobile", "shouldOverrideUrlLoading: scheme=" + (url != null ? url + "" : "NULL"));
+                if (url == null) {
+                    return false;
+                }
+                if (url.startsWith("intent://")) {
+                    String resolved = resolveIntentUrl(url);
+                    android.util.Log.d("PenpotMobile", "intent:// -> " + resolved);
+                    view.loadUrl(resolved);
                     return true;
                 }
-                return false;
+                if (url.startsWith("http:") || url.startsWith("https:")) {
+                    android.util.Log.d("PenpotMobile", "internal https navigation");
+                    return false;
+                }
+                android.util.Log.d("PenpotMobile", "scheme " + url.substring(0, Math.min(20, url.length())) + " -> original client");
+                return originalClient != null && originalClient.shouldOverrideUrlLoading(view, url);
             }
         });
 
@@ -136,6 +147,7 @@ public class MainActivity extends BridgeActivity {
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+                android.util.Log.d("PenpotMobile", "onCreateWindow (popup) isDialog=" + isDialog);
                 WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
                 transport.setWebView(webView);
                 resultMsg.sendToTarget();
@@ -176,7 +188,9 @@ public class MainActivity extends BridgeActivity {
                 String raw = url.substring(fb + "browser_fallback_url=".length());
                 int end = raw.indexOf(';');
                 if (end > 0) raw = raw.substring(0, end);
-                return URLDecoder.decode(raw, "UTF-8");
+                String decoded = URLDecoder.decode(raw, "UTF-8");
+                android.util.Log.d("PenpotMobile", "resolveIntentUrl fallback=" + decoded);
+                return decoded;
             }
             String path = url.substring("intent://".length());
             int hash = path.indexOf("#Intent;");
