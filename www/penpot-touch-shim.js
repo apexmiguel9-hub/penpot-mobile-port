@@ -104,7 +104,7 @@
 
   function createPointer(kind, x, y, pointerId) {
     try {
-      var ev = new PointerEvent('pointer' + kind, {
+      var ev = new PointerEvent(kind, {
         pointerId: pointerId || 1,
         pointerType: 'touch',
         isPrimary: true,
@@ -320,7 +320,8 @@
   function injectCss() {
     var css = [
       '@media (pointer: coarse) {',
-      '  .viewport, [class$="__viewport"] *, .viewport * { -webkit-tap-highlight-color: transparent; }',
+      '  .viewport, [class$="__viewport"], [class$="__viewport"] * { -webkit-tap-highlight-color: transparent; }',
+      '  .viewport, [class$="__viewport"] { touch-action: none; }',
       '  rect[data-position], circle[data-position] {',
       '    pointer-events: stroke; stroke: transparent;',
       '    stroke-width: 20px; vector-effect: non-scaling-stroke;',
