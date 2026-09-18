@@ -6,8 +6,9 @@
 // a plain WebView gets wrong are fixed here:
 //
 //   1. The patched CLJS gesture layer is NOT bundled in remote mode, so we
-//      inject the standalone touch shim (www/penpot-touch-shim.js) straight
-//      into the page once it reaches readyState complete.
+//      inject the standalone touch shim (www/penpot-touch-shim.js) into the
+//      Penpot pages via WebViewClient.onPageFinished(). Auth pages (Google) are
+//      skipped so our eval never touches their DOM or trips their heuristics.
 //
 //   2. Google OAuth hand-off. Penpot's frontend navigates to accounts.google.com
 //      from INSIDE the WebView. Google detects the embedded WebView and escapes
@@ -54,24 +55,19 @@ const javaEscape = (s) =>
 // already escaped), so the concatenated result is plain valid Java.
 const shimLiteral = javaEscape(shim);
 
-// Poll until the page is truly ready, then run the shim. The shim itself also
-// waits on DOMContentLoaded, so evaluating against a not-yet-ready document is
-// safe; the guard flag prevents a double install on onResume/config changes.
-const bootstrap =
-  "(function(){" +
-  "var t=setInterval(function(){" +
-  "if(document.readyState === 'complete'){clearInterval(t);" +
-  `${shimLiteral}` +
-  "}},500);" +
-  "setTimeout(function(){clearInterval(t);},60000);" +
-  "})();";
-
-const shimJava = bootstrap;
+// Inject the raw shim. It is self-guarding (window.__penpotTouchShim) and
+// self-arming (readyState/DOMContentLoaded check), so evaluating it on every
+// Penpot onPageFinished is safe and idempotent per document. We deliberately
+// do NOT evaluate it at launch: the first-load document (about:blank) is torn
+// down when the real page commits, killing any pending timers, and an eval
+// against "about:blank" can throw.
+const shimJava = shimLiteral;
 
 const activityTemplate = (pkg) =>
   `package ${pkg};
 
 import android.os.Message;
+import android.net.Uri;
 import android.webkit.JsPromptResult;
 import android.webkit.JsResult;
 import android.webkit.WebChromeClient;
@@ -87,19 +83,40 @@ public class MainActivity extends BridgeActivity {
 
     private static final String TOUCH_SHIM = "${shimJava}";
 
-    private boolean touchShimInjected = false;
+    private boolean interceptorsInstalled = false;
 
     @Override
     public void onResume() {
         super.onResume();
-        if (!touchShimInjected) {
-            touchShimInjected = true;
+        maybeRequestStoragePermission();
+        if (!interceptorsInstalled) {
+            interceptorsInstalled = true;
             WebView webView = getBridge() != null ? getBridge().getWebView() : null;
             if (webView != null) {
                 installLoginInterceptors(webView);
-                webView.evaluateJavascript(TOUCH_SHIM, null);
             }
         }
+    }
+
+    /**
+     * Image imports go through onShowFileChooser (system picker, SAF content
+     * URIs) which does not need any manifest permission, but stock Penpot can
+     * touch the media store directly on some API levels. Ask once, up-front.
+     */
+    private void maybeRequestStoragePermission() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                if (checkSelfPermission(android.Manifest.permission.READ_MEDIA_IMAGES)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{android.Manifest.permission.READ_MEDIA_IMAGES}, 9101);
+                }
+            } else if (android.os.Build.VERSION.SDK_INT >= 23) {
+                if (checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{android.Manifest.permission.READ_EXTERNAL_STORAGE}, 9102);
+                }
+            }
+        } catch (Exception ignored) { }
     }
 
     /**
@@ -118,6 +135,45 @@ public class MainActivity extends BridgeActivity {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return intercept(view, request.getUrl().toString());
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (originalClient != null) {
+                    originalClient.onPageFinished(view, url);
+                }
+                if (shouldInjectTouchShim(url)) {
+                    android.util.Log.d("PenpotMobile", "injecting touch shim on " + url);
+                    view.evaluateJavascript(TOUCH_SHIM, null);
+                }
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                if (originalClient != null) {
+                    originalClient.onPageStarted(view, url, favicon);
+                }
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, android.webkit.WebResourceError error) {
+                if (originalClient != null) {
+                    originalClient.onReceivedError(view, request, error);
+                }
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest request, android.webkit.WebResourceResponse errorResponse) {
+                if (originalClient != null) {
+                    originalClient.onReceivedHttpError(view, request, errorResponse);
+                }
+            }
+
+            @Override
+            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                if (originalClient != null) {
+                    originalClient.doUpdateVisitedHistory(view, url, isReload);
+                }
             }
 
             private boolean intercept(WebView view, String url) {
@@ -153,6 +209,15 @@ public class MainActivity extends BridgeActivity {
             }
 
             @Override
+            public boolean onShowFileChooser(WebView view, android.webkit.ValueCallback<Uri[]> filePathCallback,
+                                             FileChooserParams fileChooserParams) {
+                if (originalChrome != null) {
+                    return originalChrome.onShowFileChooser(view, filePathCallback, fileChooserParams);
+                }
+                return super.onShowFileChooser(view, filePathCallback, fileChooserParams);
+            }
+
+            @Override
             public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
                 if (originalChrome != null) return originalChrome.onJsAlert(view, url, message, result);
                 return super.onJsAlert(view, url, message, result);
@@ -173,6 +238,28 @@ public class MainActivity extends BridgeActivity {
 
         // Google's auth cookies must survive the redirect chain back to Penpot.
         android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+    }
+
+    /**
+     * Only inject the shim into Penpot app pages. Auth pages (accounts.google.*,
+     * cloud storage providers, etc.) must never receive our eval — both to avoid
+     * noise and to not trip Google's embedded-WebView heuristics.
+     */
+    private static boolean shouldInjectTouchShim(String url) {
+        if (url == null) return false;
+        try {
+            String host = android.net.Uri.parse(url).getHost();
+            if (host == null) return false;
+            host = host.toLowerCase();
+            if (host.startsWith("accounts.google.") || host.startsWith("myaccount.google.")) return false;
+            if (host.endsWith(".googleusercontent.com") || host.endsWith("gstatic.com")) return false;
+            if (host.endsWith(".googleapis.com") || host.endsWith("google.com")) return false;
+            if (host.endsWith(".youtube.com")) return false;
+            if (host.endsWith(".github.com")) return false;
+            return true;
+        } catch (Exception ex) {
+            return false;
+        }
     }
 
     /**

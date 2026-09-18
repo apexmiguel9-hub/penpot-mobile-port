@@ -135,6 +135,9 @@ jobs:
         if: ${{ env.MODE == 'remote' }}
         run: node scripts/patch-main-activity.mjs "$MODE"
 
+      - name: Patch AndroidManifest permissions
+        run: node scripts/patch-android-manifest.mjs
+
       - name: Install deterministic debug keystore
         run: |
           mkdir -p "$HOME/.android"
