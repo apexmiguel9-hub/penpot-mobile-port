@@ -138,6 +138,9 @@ jobs:
       - name: Patch AndroidManifest permissions
         run: node scripts/patch-android-manifest.mjs
 
+      - name: Pin deterministic debug signing
+        run: node scripts/patch-gradle-signing.mjs
+
       - name: Install deterministic debug keystore
         run: |
           mkdir -p "$HOME/.android"

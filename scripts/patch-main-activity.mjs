@@ -144,7 +144,7 @@ public class MainActivity extends BridgeActivity {
                 }
                 if (shouldInjectTouchShim(url)) {
                     android.util.Log.d("PenpotMobile", "injecting touch shim on " + url);
-                    view.evaluateJavascript(TOUCH_SHIM, null);
+                    armTouchShim(view);
                 }
             }
 
@@ -260,6 +260,44 @@ public class MainActivity extends BridgeActivity {
         } catch (Exception ex) {
             return false;
         }
+    }
+
+/**
+     * Install the touch shim on the loaded document, retrying until the shim
+     * confirms itself (window.__penpotTouchShim) or we give up. evaluateJavascript
+     * can be dropped silently while the renderer is mid-navigation (and its
+     * callback may never fire), so the watchdog keeps re-injecting on a timer and
+     * the callback value is the acknowledgment. The trailing expression returns
+     * the flag, so we get a definitive native answer without relying on logcat.
+     */
+    private static void armTouchShim(final WebView webView) {
+        final int[] attempts = {0};
+        final Runnable tick = new Runnable() {
+            @Override
+            public void run() {
+                if (webView == null || attempts[0] >= 60) {
+                    android.util.Log.w("PenpotMobile", "touch shim: gave up after " + attempts[0] + " attempts");
+                    return;
+                }
+                final int attempt = ++attempts[0];
+                webView.evaluateJavascript(
+                        TOUCH_SHIM + "; (window.__penpotTouchShim === true ? 'true' : 'false')",
+                        new android.webkit.ValueCallback<String>() {
+                            @Override
+                            public void onReceiveValue(String value) {
+                                boolean ok = value != null && value.trim().equals("true");
+                                android.util.Log.d("PenpotMobile", "touch shim attempt=" + attempt + " installed=" + ok + " raw=" + value);
+                                if (ok) {
+                                    attempts[0] = 999; // stop the watchdog
+                                }
+                            }
+                        });
+                if (attempts[0] < 60) {
+                    webView.postDelayed(this, 500);
+                }
+            }
+        };
+        tick.run();
     }
 
     /**
