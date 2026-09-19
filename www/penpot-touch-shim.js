@@ -173,7 +173,13 @@
     if (e.button !== 0) { return; }
     var p = pos(e);
     if (!insideViewport(e.target)) { return; }
-    if (isEditable(e.target)) { return; }  // let inputs/toolbars work
+    if (isEditable(e.target)) { return; }
+
+    // Hard reset any stuck state from previous gesture
+    if (state !== 'idle') {
+      gl('HARD RESET on new down (was ' + state + ')');
+      reset();
+    }
 
     var ptr = { x: p.x, y: p.y, startX: p.x, startY: p.y, startT: Date.now() };
     ptr.longpressTimer = setTimeout(function () {
@@ -257,6 +263,11 @@
       swallow(e);
       return;
     }
+    if (state === 'active' && !drag) {
+      gl('STUCK active without drag -> reset');
+      reset();
+      return;
+    }
 
     if (state === 'nav') { navMove(); swallow(e); return; }
   }
@@ -304,6 +315,11 @@
       // Drag ended: up at current pos while pointer still active
       gl('UP drag @' + p.x + ',' + p.y);
       dispatchPointer('pointerup', p.x, p.y, drag.id);
+      reset();
+    } else if (state === 'active' && drag) {
+      // Stuck active state with mismatched pointer - force cleanup
+      gl('FORCE CLEANUP active drag id=' + drag.id + ' (up id=' + e.pointerId + ')');
+      dispatchPointer('pointerup', drag.tx, drag.ty, drag.id);
       reset();
     } else if (state === 'nav') {
       if (pointers.size === 0) { reset(); }
