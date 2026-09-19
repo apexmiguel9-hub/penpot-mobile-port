@@ -26,9 +26,10 @@
   /* ------------------------------------------------------------------ */
   /* Config                                                             */
   /* ------------------------------------------------------------------ */
-  var SLOP         = 8;      // px before drag starts
+  var SLOP         = 15;     // px before drag starts (was 8, too sensitive)
+  var GRACE_MS     = 150;    // if 2nd finger lands within this, treat as 2-finger from start
   var LONGPRESS_MS = 500;    // hold for right-click
-  var ZOOM_SENS    = 400;    // pinch -> wheel deltaY (was 1200, too fast)
+  var ZOOM_SENS    = 400;    // pinch -> wheel deltaY
   var PAN_SENS     = 1.5;    // pan multiplier
   var TAP_MS       = 400;    // double-tap window
   var TAP_PX       = 24;     // double-tap radius
@@ -40,7 +41,7 @@
   var pointers = new Map();     // pointerId -> {x, y, startX, startY, startT, longpressTimer}
   var state    = 'idle';        // idle | armed | active | nav
   var drag     = null;          // {id, sx, sy, tx, ty}
-  var five     = null;          // armed single-finger {id, x, y, longpressTimer}
+  var five     = null;          // armed single-finger {id, x, y, longpressTimer, startT}
   var lastTap  = null;          // {x, y, t} for double-tap
   var lastNav  = { d: 0, m: null };
   var synth    = false;         // re-entrancy guard
@@ -185,15 +186,20 @@
     if (pointers.size === 1) {
       // First finger: arm tap/drag candidate
       state = 'armed';
-      five  = { id: e.pointerId, x: p.x, y: p.y, longpressTimer: ptr.longpressTimer };
+      five  = { id: e.pointerId, x: p.x, y: p.y, longpressTimer: ptr.longpressTimer, startT: ptr.startT };
       gl('down arm id=' + e.pointerId + ' @' + p.x + ',' + p.y);
       swallow(e);
     } else {
-      // Second finger: cancel armed, start 2-finger nav
+      // Second finger: check grace period - if within GRACE_MS of first finger, go straight to nav
+      var grace = five && (Date.now() - five.startT < GRACE_MS);
       if (five && five.longpressTimer) { clearTimeout(five.longpressTimer); }
+      if (grace) {
+        gl('grace 2-finger @' + p.x + ',' + p.y);
+      } else {
+        gl('late 2-finger @' + p.x + ',' + p.y);
+      }
       state = 'nav';
       lastNav = { d: 0, m: null };
-      gl('down nav +id=' + e.pointerId);
       swallow(e);
     }
   }
@@ -231,7 +237,9 @@
         return;
       }
       if (pointers.size === 2) {
+        var grace = five && (Date.now() - five.startT < GRACE_MS);
         if (five.longpressTimer) { clearTimeout(five.longpressTimer); }
+        if (grace) { gl('grace 2-finger move'); } else { gl('late 2-finger move'); }
         state = 'nav';
         lastNav = { d: 0, m: null };
         swallow(e);
