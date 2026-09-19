@@ -228,18 +228,20 @@
         if (five.longpressTimer) { clearTimeout(five.longpressTimer); }
         gl('arm->active @' + p.x + ',' + p.y + ' (slop ' + d.toFixed(0) + ')');
         state = 'active';
-        drag = { id: five.id, sx: five.x, sy: five.y, tx: p.x, ty: p.y };
+        drag = { id: five.id, sx: five.x, sy: five.y, tx: p.x, ty: p.y, onObject: false };
 
         // Determine intent at CURRENT position: object under finger = move/resize, empty = marquee
         var target = elementAt(p.x, p.y);
         var vc = viewportControlsNode();
         var onObject = target && target !== vc && vc.contains(target);
-        // For move/resize, target the object; for marquee, target viewport-controls
-        // Penpot's gate accepts pointerdown on viewport-controls for marquee, on object for move
+        drag.onObject = onObject;
 
-        // Prime hover at current pos, then down at ORIGINAL pos (for correct anchor), then move to current
+        // Target: object under finger for move/resize, viewport-controls for marquee
+        var useTarget = onObject ? target : vc;
+
+        // Prime hover at target, then down at SAME position (current finger = anchor), then move
         dispatchPointer('pointermove', p.x, p.y, five.id);
-        dispatchPointer('pointerdown', five.x, five.y, five.id);
+        dispatchPointer('pointerdown', p.x, p.y, five.id);
         dispatchPointer('pointermove', p.x, p.y, five.id);
         swallow(e);
         return;
