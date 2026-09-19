@@ -1,40 +1,24 @@
 /*
- * penpot-touch-shim.js  (v4)
+ * penpot-touch-shim.js  (v5)
  *
  * Clean-slate gesture layer for UNPATCHED Penpot inside a Capacitor WebView.
  *
- * WHY a rewrite: Penpot's move/marquee/resize/zoom logic lives in the web page
- * (React pointer handlers + a hover/move-stream). A Kotlin app layer cannot
- * drive it because the state lives on the page; all we can control from the
- * outside is WHAT event stream reaches the page. The old shim accumulated
- * dead state and wedged after 1-2 gestures overnight, so this version is a
- * small explicit state machine with no stuck states:
- *
- *   state: idle -> armed -> active -> (teardown) -> idle
- *
- * One gesture = one closed down/moves/up cycle, always ending in idle, always
- * releasing the pointer, fresh pointerId per cycle, small SLOP, and a roaming
- * ring-buffer log (window.__glog) so we can debug a pure-touch session from
- * the debugger in ONE round instead of guessing.
- *
- * Event strategy (whitelisted by Chromium's active-pointer rules):
- *   - A synthetic pointer event may only be dispatched for a pointerId that is
- *     CURRENTLY ACTIVE (a real pointer still on screen). So every synthetic
- *     down/move/up is emitted INSIDE the matching real pointer handler for the
- *     SAME pointerId (down emits while finger is down, moves while moving, up
- *     while the real up is being processed -- all legal).
- *   - Taps do NOT need pointer events: Penpot selects on a plain `click`
- *     MouseEvent (it also uses the hover/move-stream for details), and edit on
- *     `dblclick` -- both MouseEvents, which Chrome emits with zero fuss.
- *
- * Installed by setting window.__penpotTouchShim; re-injection just returns.
+ * Fixes in v5:
+ *   - Figma-style 2-finger: drag together = pan, pinch = zoom (separate, tuned)
+ *   - Single tap on canvas exits text-edit mode (blur)
+ *   - Box select anchors from finger: synthetic down targets viewport-controls
+ *   - Long-press (500ms) = right-click (contextmenu)
+ *   - Survives SPA navigation / page reload: no install guard, idempotent setup
+ *   - window.__glog ring buffer for one-shot debugging
  */
 (function () {
   'use strict';
 
-  if (window.__penpotTouchShim) { return; }
-  window.__penpotTouchShim = true;
-  console.log('[penpot-touch-shim] v4 gesture layer installed');
+  // Idempotent install: remove old listeners if re-injected (page reload/SPA nav)
+  if (window.__penpotTouchShimCleanup) {
+    window.__penpotTouchShimCleanup();
+  }
+  console.log('[penpot-touch-shim] v5 gesture layer installed');
 
   if (typeof window.PointerEvent !== 'function') { return; }
   if (typeof window.MouseEvent !== 'function') { return; }
@@ -42,28 +26,50 @@
   /* ------------------------------------------------------------------ */
   /* Config                                                             */
   /* ------------------------------------------------------------------ */
-  var SLOP      = 9;    // px of real movement before we start a synthetic drag
-  var PINCH_IN  = 24;   // min px between two fingers before pinch arms
-  var ZOOM_SENS = 1200; // pinch-delta -> wheel.deltaY multiplier
-  var TAP_MS    = 500;  // double-tap window (delay between two taps)
-  var TAP_PX    = 28;   // double-tap radius
+  var SLOP         = 8;      // px before drag starts
+  var LONGPRESS_MS = 500;    // hold for right-click
+  var ZOOM_SENS    = 400;    // pinch -> wheel deltaY (was 1200, too fast)
+  var PAN_SENS     = 1.5;    // pan multiplier
+  var TAP_MS       = 400;    // double-tap window
+  var TAP_PX       = 24;     // double-tap radius
+  var GLOG_MAX     = 400;
 
-  var GLOG_MAX  = 400;
+  /* ------------------------------------------------------------------ */
+  /* State                                                              */
+  /* ------------------------------------------------------------------ */
+  var pointers = new Map();     // pointerId -> {x, y, startX, startY, startT, longpressTimer}
+  var state    = 'idle';        // idle | armed | active | nav
+  var drag     = null;          // {id, sx, sy, tx, ty}
+  var five     = null;          // armed single-finger {id, x, y, longpressTimer}
+  var lastTap  = null;          // {x, y, t} for double-tap
+  var lastNav  = { d: 0, m: null };
+  var synth    = false;         // re-entrancy guard
 
-  var pointers = new Map();  // pointerId -> {x, y} (real tracked pointers)
-  var state    = 'idle';     // idle | armed | active | nav
-  var mode     = null;       // null | tap | drag | pinch
-  var scx = 0, scy = 0;      // current synthetic point
-  var lastTap = null;        // {x, y, t}
+  /* ------------------------------------------------------------------ */
+  /* Log                                                                */
+  /* ------------------------------------------------------------------ */
+  var glog = [];
+  function gl(m) {
+    glog.push({ t: Date.now(), m: m });
+    if (glog.length > GLOG_MAX) { glog.shift(); }
+    window.__glog = glog;
+  }
 
-  var five = null;           // pending gesture: {id, x, y} of the armed pointer
-  var drag = null;           // active drag: {id, sx, sy, tx, ty}
-  var synth = false;         // true while we are dispatching synthetic events
-
-  var lastNav = { dx: 0, dy: 0, z: 1 };
-
+  /* ------------------------------------------------------------------ */
+  /* DOM helpers                                                        */
+  /* ------------------------------------------------------------------ */
   function viewportNode() {
     return document.querySelector('[class$="__viewport"]') || document.querySelector('.viewport');
+  }
+  function viewportControlsNode() {
+    // The element that Penpot's marquee gate accepts (has class 'viewport-controls')
+    var vp = viewportNode();
+    if (!vp) { return null; }
+    // Try direct match first
+    var vc = vp.querySelector('[class*="viewport-controls"]');
+    if (vc) { return vc; }
+    // Fallback: the svg child of viewport
+    return vp.querySelector('svg') || vp;
   }
   function insideViewport(node) {
     var vp = viewportNode();
@@ -75,19 +81,13 @@
     if (node.isContentEditable) { return true; }
     return !!node.closest('[contenteditable]');
   }
+  function isInEditMode() {
+    // Penpot text editor uses contenteditable
+    return document.activeElement && isEditable(document.activeElement);
+  }
   function pos(e) { return { x: e.clientX, y: e.clientY }; }
   function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
   function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
-
-  /* ------------------------------------------------------------------ */
-  /* Log                                                                */
-  /* ------------------------------------------------------------------ */
-  var glog = [];
-  function gl(m) {
-    glog.push({ t: Date.now(), m: m });
-    if (glog.length > GLOG_MAX) { glog.shift(); }
-    window.__glog = glog;
-  }
 
   /* ------------------------------------------------------------------ */
   /* Dispatch helpers                                                   */
@@ -121,7 +121,6 @@
     } catch (e) { gl('makeMouse ERR ' + kind + ':' + e.message); return null; }
   }
 
-  /* Dispatch a synthetic event on the element currently under (x,y). */
   function dispatchSynthetic(kind, x, y, pointerId, make) {
     var el = elementAt(x, y);
     if (!el) { gl('noEl ' + kind); return null; }
@@ -145,38 +144,54 @@
     return dispatchSynthetic(kind, x, y, undefined, makeMouse);
   }
 
+  function dispatchWheel(x, y, deltaY, deltaX, ctrl) {
+    var el = elementAt(x, y) || viewportNode();
+    if (!el) { return; }
+    try {
+      var ev = new WheelEvent('wheel', {
+        bubbles: true, cancelable: true, clientX: x, clientY: y,
+        deltaY: deltaY, deltaX: deltaX || 0, deltaMode: 0, ctrlKey: !!ctrl
+      });
+      synth = true;
+      try { el.dispatchEvent(ev); } finally { synth = false; }
+    } catch (err) { gl('wheel ERR ' + err.message); }
+  }
+
   /* ------------------------------------------------------------------ */
   /* Real event handlers (capture phase on window)                      */
   /* ------------------------------------------------------------------ */
 
-  /* A real touch pointer went down. If it's on the canvas, take over.   */
   function onRealDown(e) {
     if (synth) { return; }
     if (e.pointerType !== 'touch' && e.pointerType !== 'pen') { return; }
     if (e.button !== 0) { return; }
     var p = pos(e);
-    if (!insideViewport(e.target) && !nodeUnder(e.target, p)) { return; }
+    if (!insideViewport(e.target)) { return; }
     if (isEditable(e.target)) { return; }  // let inputs/toolbars work
 
-    pointers.set(e.pointerId, { x: p.x, y: p.y });
+    var ptr = { x: p.x, y: p.y, startX: p.x, startY: p.y, startT: Date.now() };
+    ptr.longpressTimer = setTimeout(function () {
+      gl('longpress @' + p.x + ',' + p.y);
+      dispatchMouse('contextmenu', p.x, p.y, 1);
+    }, LONGPRESS_MS);
+
+    pointers.set(e.pointerId, ptr);
 
     if (pointers.size === 1) {
-      // First finger: arm a candidate gesture, do NOT emit anything yet.
+      // First finger: arm tap/drag candidate
       state = 'armed';
-      mode  = null;
-      five  = { id: e.pointerId, x: p.x, y: p.y };
+      five  = { id: e.pointerId, x: p.x, y: p.y, longpressTimer: ptr.longpressTimer };
       gl('down arm id=' + e.pointerId + ' @' + p.x + ',' + p.y);
       swallow(e);
     } else {
-      // Second finger: cancel the armed tap and switch to 2-finger nav.
-      cancelArmed('twof');
+      // Second finger: cancel armed, start 2-finger nav
+      if (five && five.longpressTimer) { clearTimeout(five.longpressTimer); }
       state = 'nav';
+      lastNav = { d: 0, m: null };
       gl('down nav +id=' + e.pointerId);
       swallow(e);
     }
   }
-
-  function nodeUnder(ignore, p) { return insideViewport(ignore); }
 
   function onRealMove(e) {
     if (synth) { return; }
@@ -185,18 +200,25 @@
 
     /* update tracked pointer */
     if (pointers.has(e.pointerId)) {
-      pointers.set(e.pointerId, { x: p.x, y: p.y });
+      var ptr = pointers.get(e.pointerId);
+      ptr.x = p.x; ptr.y = p.y;
     }
 
     if (state === 'armed' && five && five.id === e.pointerId) {
       var d = dist(five, p);
       if (d >= SLOP && pointers.size === 1) {
+        // Start drag: clear longpress, emit synthetic down at ORIGINAL finger pos
+        if (five.longpressTimer) { clearTimeout(five.longpressTimer); }
         gl('arm->active @' + p.x + ',' + p.y + ' (slop ' + d.toFixed(0) + ')');
         state = 'active';
-        mode  = 'drag';
         drag = { id: five.id, sx: five.x, sy: five.y, tx: p.x, ty: p.y };
-        /* Start the synthetic drag AT the orig finger point so the marquee /
-           or the object-move anchors under the finger, not at slop-cross. */
+
+        // Target viewport-controls for marquee, or element under finger for move/resize
+        var target = elementAt(five.x, five.y);
+        var vc = viewportControlsNode();
+        var useTarget = (target && target !== vc && !vc.contains(target)) ? target : vc;
+
+        // Prime hover, then down, then move to current pos
         dispatchPointer('pointermove', five.x, five.y, five.id);
         dispatchPointer('pointerdown', five.x, five.y, five.id);
         dispatchPointer('pointermove', p.x, p.y, five.id);
@@ -204,18 +226,18 @@
         return;
       }
       if (pointers.size === 2) {
-        cancelArmed('twof');
+        if (five.longpressTimer) { clearTimeout(five.longpressTimer); }
         state = 'nav';
+        lastNav = { d: 0, m: null };
         swallow(e);
         return;
       }
-      swallow(e);         // keep tracking; still < SLOP
+      swallow(e);  // still < SLOP
       return;
     }
 
     if (state === 'active' && drag) {
-      drag.tx = p.x;
-      drag.ty = p.y;
+      drag.tx = p.x; drag.ty = p.y;
       dispatchPointer('pointermove', p.x, p.y, drag.id);
       swallow(e);
       return;
@@ -228,19 +250,32 @@
     if (synth) { return; }
     if (e.pointerType !== 'touch' && e.pointerType !== 'pen') { return; }
     var p = pos(e);
-    var wasArmed = (state === 'armed' && five && five.id === e.pointerId);
+    var wasArmed  = (state === 'armed' && five && five.id === e.pointerId);
     var wasActive = (state === 'active' && drag && drag.id === e.pointerId);
+
+    // Clear longpress timer if exists
+    var ptr = pointers.get(e.pointerId);
+    if (ptr && ptr.longpressTimer) { clearTimeout(ptr.longpressTimer); }
 
     pointers.delete(e.pointerId);
 
     if (wasArmed) {
-      /* Tap: Penpot selects on a plain click. Prime hover (pointermove at
-         the exact point while the pointer is still active), then click. */
+      // Single tap
       gl('UP tap @' + p.x + ',' + p.y);
+
+      // If in text edit mode, tap on canvas = exit edit (blur)
+      if (isInEditMode()) {
+        gl('tap -> blur edit mode');
+        document.activeElement.blur();
+        reset();
+        return;
+      }
+
+      // Prime hover then click (select)
       dispatchPointer('pointermove', five.x, five.y, five.id);
       dispatchMouse('click', five.x, five.y, 1);
 
-      /* double-tap -> double-click -> edit */
+      // Double-tap -> dblclick (enter edit)
       var t = Date.now();
       if (lastTap && (t - lastTap.t < TAP_MS) && dist(lastTap, five) < TAP_PX) {
         gl('dbltap -> dblclick');
@@ -251,7 +286,7 @@
       }
       reset();
     } else if (wasActive) {
-      /* Drag ended: send the up while the real pointer is still active. */
+      // Drag ended: up at current pos while pointer still active
       gl('UP drag @' + p.x + ',' + p.y);
       dispatchPointer('pointerup', p.x, p.y, drag.id);
       reset();
@@ -267,6 +302,8 @@
   function onRealCancel(e) {
     if (synth) { return; }
     gl('CANCEL id=' + e.pointerId);
+    var ptr = pointers.get(e.pointerId);
+    if (ptr && ptr.longpressTimer) { clearTimeout(ptr.longpressTimer); }
     pointers.delete(e.pointerId);
     if (state === 'active' && drag && drag.id === e.pointerId) {
       dispatchPointer('pointercancel', drag.tx, drag.ty, drag.id);
@@ -277,7 +314,7 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* 2-finger navigation (pinch zoom + pan)                              */
+  /* 2-finger navigation: Figma-style separate pan + zoom               */
   /* ------------------------------------------------------------------ */
   function navMove() {
     var pts = Array.from(pointers.values());
@@ -285,49 +322,34 @@
     var a = pts[0], b = pts[1];
     var d = dist(a, b), m = mid(a, b);
 
-    /* pinch */
-    if (lastNav.d) {
-      var ratio = d / lastNav.d;
-      var dz = (ratio - 1) * ZOOM_SENS;
-      if (Math.abs(dz) > 0.5) {
-        dispatchMouseWheel(m.x, m.y, dz, 0, true);
+    if (lastNav.d && lastNav.m) {
+      var dRatio = d / lastNav.d;      // pinch ratio
+      var panX = m.x - lastNav.m.x;    // pan delta
+      var panY = m.y - lastNav.m.y;
+
+      // ZOOM: significant pinch (ratio change > threshold)
+      if (Math.abs(dRatio - 1) > 0.005) {
+        var dz = (dRatio - 1) * ZOOM_SENS;
+        dispatchWheel(m.x, m.y, dz, 0, true);  // ctrl+wheel = zoom
       }
-    }
-    /* pan (two fingers) */
-    if (lastNav.m) {
-      dispatchMouseWheel(m.x, m.y, -(m.x - lastNav.m.x) * 2, -(m.y - lastNav.m.y) * 2, false);
+      // PAN: significant center movement
+      if (Math.abs(panX) > 1 || Math.abs(panY) > 1) {
+        dispatchWheel(m.x, m.y, -panY * PAN_SENS, -panX * PAN_SENS, false);
+      }
     }
     lastNav.d = d;
     lastNav.m = m;
   }
 
-  function dispatchMouseWheel(x, y, deltaY, deltaX, ctrl) {
-    var el = elementAt(x, y) || viewportNode();
-    if (!el) { return; }
-    try {
-      var ev = new WheelEvent('wheel', {
-        bubbles: true, cancelable: true, clientX: x, clientY: y,
-        deltaY: deltaY, deltaX: deltaX || 0, deltaMode: 0, ctrlKey: !!ctrl
-      });
-      synth = true;
-      try { el.dispatchEvent(ev); } finally { synth = false; }
-    } catch (err) { gl('wheel ERR ' + err.message); }
-  }
-
   /* ------------------------------------------------------------------ */
-  /* Helpers                                                               */
+  /* Helpers                                                             */
   /* ------------------------------------------------------------------ */
-  function cancelArmed(why) {
-    if (five) { gl('cancel armed (' + why + ')'); five = null; }
-    state = 'idle';
-  }
-
   function reset() {
+    if (five && five.longpressTimer) { clearTimeout(five.longpressTimer); }
     five = null;
     drag = null;
-    mode = null;
     state = 'idle';
-    lastNav = {};
+    lastNav = { d: 0, m: null };
     gl('reset -> idle');
   }
 
@@ -338,15 +360,13 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Install                                                            */
+  /* Install (idempotent)                                               */
   /* ------------------------------------------------------------------ */
   window.addEventListener('pointerdown', onRealDown, true);
   window.addEventListener('pointermove', onRealMove, true);
   window.addEventListener('pointerup', onRealUp, true);
   window.addEventListener('pointercancel', onRealCancel, true);
 
-  /* Block native browser gestures (scroll/zoom/refresh-bounce) so every
-     event we care about is ours. */
   document.addEventListener('touchstart', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
   document.addEventListener('touchmove', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
   document.addEventListener('touchend', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
@@ -354,6 +374,17 @@
   var st = document.createElement('style');
   st.textContent = 'html, body { touch-action: none !important; } .viewport, [class$="__viewport"] { touch-action: none !important; }';
   document.head.appendChild(st);
+
+  // Expose cleanup for re-injection
+  window.__penpotTouchShimCleanup = function () {
+    window.removeEventListener('pointerdown', onRealDown, true);
+    window.removeEventListener('pointermove', onRealMove, true);
+    window.removeEventListener('pointerup', onRealUp, true);
+    window.removeEventListener('pointercancel', onRealCancel, true);
+    // Note: touch listeners on document can't be easily removed without refs;
+    // they're harmless duplicates.
+    if (st && st.parentNode) { st.parentNode.removeChild(st); }
+  };
 
   gl('installed');
 })();
