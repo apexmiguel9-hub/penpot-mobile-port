@@ -1,366 +1,359 @@
 /*
- * penpot-touch-shim.js  (v2)
+ * penpot-touch-shim.js  (v4)
  *
- * Standalone gesture layer for UNPATCHED Penpot deployments.
+ * Clean-slate gesture layer for UNPATCHED Penpot inside a Capacitor WebView.
  *
- * v2 design: Penpot's own pointer handlers already do the right thing for the
- * move tool (empty-canvas drag -> marquee select; object drag -> move; tap ->
- * select + resize handles), but on a touchscreen the raw events are a mess:
- * the marquee starts from the very first finger wriggle (so 2-finger pinch
- * zooms are polluted by a stray selection box), and the marquee can also get
- * re-anchored off the finger (nested marquee started on the previous marquee's
- * fat invisible stroke). We therefore SWALLOW every touch pointer event inside
- * the `.viewport` and re-emit our own SYNTHETIC pointer events with precise
- * coordinates to drive the exact same native handlers:
+ * WHY a rewrite: Penpot's move/marquee/resize/zoom logic lives in the web page
+ * (React pointer handlers + a hover/move-stream). A Kotlin app layer cannot
+ * drive it because the state lives on the page; all we can control from the
+ * outside is WHAT event stream reaches the page. The old shim accumulated
+ * dead state and wedged after 1-2 gestures overnight, so this version is a
+ * small explicit state machine with no stuck states:
  *
- *   - single finger, moves < SLOP then up ......... tap  -> synthetic
- *     pointerdown/up at the true touch point + a click (select + handles).
- *   - two quick taps .................................. synthetic dblclick
- *     (enter text editing, as desktop).
- *   - single finger drag from EMPTY canvas ......... synthetic pointer
- *     events anchored EXACTLY at the touch-down point -> native marquee
- *     select, un-shifted.
- *   - single finger drag ON a shape ................ synthetic pointer
- *     events -> native object move.
- *   - second finger lands .......................... the pending single-finger
- *     gesture is discarded (marquee never starts) and 2-finger CANVAS
- *     NAVIGATION takes over (pinch zoom + pan, synthesized as ctrl-wheel).
+ *   state: idle -> armed -> active -> (teardown) -> idle
  *
- * Nothing is ever re-emitted while two fingers are down, so zoom/pan is clean.
+ * One gesture = one closed down/moves/up cycle, always ending in idle, always
+ * releasing the pointer, fresh pointerId per cycle, small SLOP, and a roaming
+ * ring-buffer log (window.__glog) so we can debug a pure-touch session from
+ * the debugger in ONE round instead of guessing.
  *
- * Note: events are swallowed in the CAPTURE phase at window level, so we must
- * NOT swallow events targeting editable nodes (input/textarea/contenteditable
- * inside the canvas text editor) or anything outside the `.viewport`.
+ * Event strategy (whitelisted by Chromium's active-pointer rules):
+ *   - A synthetic pointer event may only be dispatched for a pointerId that is
+ *     CURRENTLY ACTIVE (a real pointer still on screen). So every synthetic
+ *     down/move/up is emitted INSIDE the matching real pointer handler for the
+ *     SAME pointerId (down emits while finger is down, moves while moving, up
+ *     while the real up is being processed -- all legal).
+ *   - Taps do NOT need pointer events: Penpot selects on a plain `click`
+ *     MouseEvent (it also uses the hover/move-stream for details), and edit on
+ *     `dblclick` -- both MouseEvents, which Chrome emits with zero fuss.
+ *
+ * Installed by setting window.__penpotTouchShim; re-injection just returns.
  */
 (function () {
   'use strict';
 
   if (window.__penpotTouchShim) { return; }
   window.__penpotTouchShim = true;
-  console.log("[penpot-touch-shim] v2 gesture layer installed");
+  console.log('[penpot-touch-shim] v4 gesture layer installed');
 
   if (typeof window.PointerEvent !== 'function') { return; }
+  if (typeof window.MouseEvent !== 'function') { return; }
 
-  var SLOP = 7;          // px of movement required to turn a touch into a drag
-  var MIN_PINCH = 24;    // px between fingers before pinch arms
-  var ZOOM_SENS   = 1100; // deltaY mapping: (scale-1)*-ZOOM_SENS
-  var TAP_GRACE  = 300;   // ms window for double-tap detection
-  var TAP_RADIUS = 26;    // px radius for double-tap detection
+  /* ------------------------------------------------------------------ */
+  /* Config                                                             */
+  /* ------------------------------------------------------------------ */
+  var SLOP      = 9;    // px of real movement before we start a synthetic drag
+  var PINCH_IN  = 24;   // min px between two fingers before pinch arms
+  var ZOOM_SENS = 1200; // pinch-delta -> wheel.deltaY multiplier
+  var TAP_MS    = 500;  // double-tap window (delay between two taps)
+  var TAP_PX    = 28;   // double-tap radius
 
-  var pointers = new Map();  // pointerId -> {x,y}
-  var navActive = false;
-  var pinchDist = null;
-  var nav = { dx: 0, dy: 0, raf: 0, lastMid: null };
+  var GLOG_MAX  = 400;
 
-  var syn = null;            // pending/active synthetic gesture for pointer 1
-  var lastTap = null;        // {x, y, t} of previous tap
-  var synthActive = false;   // true while we dispatch synthetic events
+  var pointers = new Map();  // pointerId -> {x, y} (real tracked pointers)
+  var state    = 'idle';     // idle | armed | active | nav
+  var mode     = null;       // null | tap | drag | pinch
+  var scx = 0, scy = 0;      // current synthetic point
+  var lastTap = null;        // {x, y, t}
+
+  var five = null;           // pending gesture: {id, x, y} of the armed pointer
+  var drag = null;           // active drag: {id, sx, sy, tx, ty}
+  var synth = false;         // true while we are dispatching synthetic events
+
+  var lastNav = { dx: 0, dy: 0, z: 1 };
 
   function viewportNode() {
     return document.querySelector('[class$="__viewport"]') || document.querySelector('.viewport');
   }
-
   function insideViewport(node) {
     var vp = viewportNode();
     return !!(node && vp && (node === vp || vp.contains(node)));
   }
-
   function isEditable(node) {
     if (!node || !node.matches) { return false; }
     if (node.matches('input, textarea, select')) { return true; }
     if (node.isContentEditable) { return true; }
     return !!node.closest('[contenteditable]');
   }
-
   function pos(e) { return { x: e.clientX, y: e.clientY }; }
-
   function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
-
   function mid(a, b) { return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; }
 
-  function wheel(target, opts) {
-    try {
-      var ev = new WheelEvent('wheel', {
-        deltaX: opts.deltaX || 0,
-        deltaY: opts.deltaY || 0,
-        clientX: opts.clientX || 0,
-        clientY: opts.clientY || 0,
-        ctrlKey: !!opts.ctrlKey,
-        bubbles: true,
-        cancelable: true
-      });
-      target.dispatchEvent(ev);
-    } catch (err) { /* non-fatal */ }
+  /* ------------------------------------------------------------------ */
+  /* Log                                                                */
+  /* ------------------------------------------------------------------ */
+  var glog = [];
+  function gl(m) {
+    glog.push({ t: Date.now(), m: m });
+    if (glog.length > GLOG_MAX) { glog.shift(); }
+    window.__glog = glog;
   }
 
-  function flushNav() {
-    nav.raf = 0;
-    var vp = viewportNode();
-    if (!vp || !navActive) { nav.dx = 0; nav.dy = 0; return; }
-    wheel(vp, { deltaX: nav.dx, deltaY: nav.dy });
-    nav.dx = 0;
-    nav.dy = 0;
+  /* ------------------------------------------------------------------ */
+  /* Dispatch helpers                                                   */
+  /* ------------------------------------------------------------------ */
+  function elementAt(x, y) {
+    return document.elementFromPoint(x, y);
   }
 
-  function createPointer(kind, x, y, pointerId) {
+  function makePointer(kind, x, y, pointerId) {
     try {
       var ev = new PointerEvent(kind, {
-        pointerId: pointerId || 1,
-        pointerType: 'touch',
-        isPrimary: true,
-        bubbles: true,
-        cancelable: true,
-        button: 0,
-        buttons: (kind === 'move') ? 1 : 0,
-        clientX: x,
-        clientY: y
+        pointerId: pointerId, pointerType: 'touch', isPrimary: true,
+        bubbles: true, cancelable: true, button: 0,
+        buttons: (kind === 'pointermove') ? 1 : 0,
+        clientX: x, clientY: y
       });
-      // Penpot (app/util/dom.cljs) decides mouse-buttons via `event.which`
-      // (left-mouse? == (= 1 which)) and synthesized PointerEvents default to
-      // which === 0, which Penpot reads as "not a click". Pin it to 1.
       Object.defineProperty(ev, 'which', { value: 1, configurable: true });
       Object.defineProperty(ev, 'detail', { value: 1, configurable: true });
       return ev;
-    } catch (err) { return null; }
+    } catch (e) { gl('makePointer ERR ' + kind + ':' + e.message); return null; }
   }
 
-  function dispatchAt(kind, x, y, pointerId) {
-    var el = document.elementFromPoint(x, y);
-    if (!el) { return null; }
-    var ev = createPointer(kind, x, y, pointerId);
+  function makeMouse(kind, x, y, detail) {
+    try {
+      var ev = new MouseEvent(kind, {
+        bubbles: true, cancelable: true, detail: detail || 1, button: 0,
+        clientX: x, clientY: y
+      });
+      Object.defineProperty(ev, 'which', { value: 1, configurable: true });
+      return ev;
+    } catch (e) { gl('makeMouse ERR ' + kind + ':' + e.message); return null; }
+  }
+
+  /* Dispatch a synthetic event on the element currently under (x,y). */
+  function dispatchSynthetic(kind, x, y, pointerId, make) {
+    var el = elementAt(x, y);
+    if (!el) { gl('noEl ' + kind); return null; }
+    var ev = make(kind, x, y, pointerId);
     if (!ev) { return null; }
-    synthActive = true;
+    synth = true;
     try {
       el.dispatchEvent(ev);
+    } catch (e) {
+      gl('dispatch ERR ' + kind + ' @' + x + ',' + y + ' -> ' + e.message);
     } finally {
-      synthActive = false;
+      synth = false;
     }
     return el;
   }
 
+  function dispatchPointer(kind, x, y, pointerId) {
+    return dispatchSynthetic(kind, x, y, pointerId, makePointer);
+  }
   function dispatchMouse(kind, x, y, detail) {
-    var el = document.elementFromPoint(x, y);
-    if (!el) { return; }
-    try {
-      var ev = new MouseEvent(kind, {
-        bubbles: true,
-        cancelable: true,
-        detail: detail || 1,
-        button: 0,
-        clientX: x,
-        clientY: y
-      });
-      Object.defineProperty(ev, 'which', { value: 1, configurable: true });
-      synthActive = true;
-      try {
-        el.dispatchEvent(ev);
-      } finally {
-        synthActive = false;
-      }
-    } catch (err) { /* non-fatal */ }
+    return dispatchSynthetic(kind, x, y, undefined, makeMouse);
   }
 
-  // Finish a pending or in-flight synthetic gesture.
-  function tearDownSynthetic(endX, endY) {
-    if (!syn) { return; }
-    if (syn.active) {
-      dispatchAt('pointerup', endX, endY, syn.id);
+  /* ------------------------------------------------------------------ */
+  /* Real event handlers (capture phase on window)                      */
+  /* ------------------------------------------------------------------ */
+
+  /* A real touch pointer went down. If it's on the canvas, take over.   */
+  function onRealDown(e) {
+    if (synth) { return; }
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') { return; }
+    if (e.button !== 0) { return; }
+    var p = pos(e);
+    if (!insideViewport(e.target) && !nodeUnder(e.target, p)) { return; }
+    if (isEditable(e.target)) { return; }  // let inputs/toolbars work
+
+    pointers.set(e.pointerId, { x: p.x, y: p.y });
+
+    if (pointers.size === 1) {
+      // First finger: arm a candidate gesture, do NOT emit anything yet.
+      state = 'armed';
+      mode  = null;
+      five  = { id: e.pointerId, x: p.x, y: p.y };
+      gl('down arm id=' + e.pointerId + ' @' + p.x + ',' + p.y);
+      swallow(e);
     } else {
-      // No movement passed slop: it was a tap => select / show handles.
-      var sx = syn.sx;
-      var sy = syn.sy;
-      dispatchAt('pointerdown', sx, sy, syn.id);
-      dispatchAt('pointerup', endX, endY, syn.id);
-      dispatchMouse('click', endX, endY, 1);
-      var now = Date.now();
-      if (lastTap && now - lastTap.t < TAP_GRACE && dist({ x: endX, y: endY }, lastTap) < TAP_RADIUS) {
-        dispatchMouse('dblclick', endX, endY, 2);
-        lastTap = null;
-      } else {
-        lastTap = { x: endX, y: endY, t: now };
-      }
+      // Second finger: cancel the armed tap and switch to 2-finger nav.
+      cancelArmed('twof');
+      state = 'nav';
+      gl('down nav +id=' + e.pointerId);
+      swallow(e);
     }
-    syn = null;
   }
 
-  function onPointerDown(e) {
-    if (synthActive) { return; } // never swallow our own re-emitted events
-    if (e.pointerType !== 'touch' || !insideViewport(e.target) || isEditable(e.target)) { return; }
+  function nodeUnder(ignore, p) { return insideViewport(ignore); }
 
-    // Swallow: Penpot's viewport handlers must not see the raw touch events.
-    e.preventDefault();
-    e.stopImmediatePropagation();
+  function onRealMove(e) {
+    if (synth) { return; }
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') { return; }
+    var p = pos(e);
 
-    pointers.set(e.pointerId, pos(e));
-
-    if (pointers.size >= 2) {
-      // Second finger lands: nav takes over; drop any pending single gesture.
-      if (syn) {
-        if (syn.active) {
-          dispatchAt('pointerup', e.clientX, e.clientY, syn.id);
-        }
-        syn = null;
-      }
-      navActive = true;
-      pinchDist = null;
-      nav.dx = 0;
-      nav.dy = 0;
-      nav.lastMid = null;
-      return;
+    /* update tracked pointer */
+    if (pointers.has(e.pointerId)) {
+      pointers.set(e.pointerId, { x: p.x, y: p.y });
     }
 
-    syn = { id: e.pointerId, sx: e.clientX, sy: e.clientY, active: false };
-  }
-
-  function onPointerMove(e) {
-    if (synthActive) { return; } // never swallow our own re-emitted events
-    if (e.pointerType !== 'touch' || !insideViewport(e.target)) { return; }
-
-    var tracked = pointers.has(e.pointerId);
-    if (!tracked && !navActive && !syn) { return; }
-
-    e.preventDefault();
-    e.stopImmediatePropagation();
-
-    if (tracked) { pointers.set(e.pointerId, pos(e)); }
-
-    if (navActive && tracked) {
-      if (pointers.size < 2) { return; }
-
-      var it = pointers.values();
-      var a = it.next().value;
-      var b = it.next().value;
-      var d = dist(a, b);
-      var m = mid(a, b);
-
-      if (pinchDist === null) {
-        if (d < MIN_PINCH) { return; }
-        pinchDist = d;
-        nav.dx = 0;
-        nav.dy = 0;
+    if (state === 'armed' && five && five.id === e.pointerId) {
+      var d = dist(five, p);
+      if (d >= SLOP && pointers.size === 1) {
+        gl('arm->active @' + p.x + ',' + p.y + ' (slop ' + d.toFixed(0) + ')');
+        state = 'active';
+        mode  = 'drag';
+        drag = { id: five.id, sx: five.x, sy: five.y, tx: p.x, ty: p.y };
+        /* Start the synthetic drag AT the orig finger point so the marquee /
+           or the object-move anchors under the finger, not at slop-cross. */
+        dispatchPointer('pointermove', five.x, five.y, five.id);
+        dispatchPointer('pointerdown', five.x, five.y, five.id);
+        dispatchPointer('pointermove', p.x, p.y, five.id);
+        swallow(e);
         return;
       }
-
-      var scale = d / pinchDist;
-      if (Math.abs(scale - 1) > 0.0001) {
-        var deltaY = (1 - scale) * ZOOM_SENS;
-        pinchDist = d;
-        wheel(viewportNode() || e.target, { deltaY: deltaY, ctrlKey: true, clientX: m.x, clientY: m.y });
+      if (pointers.size === 2) {
+        cancelArmed('twof');
+        state = 'nav';
+        swallow(e);
+        return;
       }
-
-      nav.dx += m.x - (nav.lastMid ? nav.lastMid.x : m.x);
-      nav.dy += m.y - (nav.lastMid ? nav.lastMid.y : m.y);
-      nav.lastMid = m;
-      if (!nav.raf) { nav.raf = requestAnimationFrame(flushNav); }
+      swallow(e);         // keep tracking; still < SLOP
       return;
     }
 
-    if (!syn) { return; }
-
-    var p = pos(e);
-    if (!syn.active) {
-      var moved = dist({ x: syn.sx, y: syn.sy }, p);
-      if (moved < SLOP) { return; }
-      // Awaits the native blur: emit the down AT the original touch point so
-      // the marquee / object move is anchored exactly under the finger.
-      dispatchAt('pointerdown', syn.sx, syn.sy, syn.id);
-      syn.active = true;
+    if (state === 'active' && drag) {
+      drag.tx = p.x;
+      drag.ty = p.y;
+      dispatchPointer('pointermove', p.x, p.y, drag.id);
+      swallow(e);
+      return;
     }
-    dispatchAt('pointermove', p.x, p.y, syn.id);
+
+    if (state === 'nav') { navMove(); swallow(e); return; }
   }
 
-  function onPointerUp(e) {
-    if (synthActive) { return; } // never swallow our own re-emitted events
-    if (e.pointerType !== 'touch') { return; }
-
-    if (insideViewport(e.target) && !isEditable(e.target)) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-    }
-
-    if (syn && e.pointerId === syn.id) {
-      tearDownSynthetic(e.clientX, e.clientY);
-    }
+  function onRealUp(e) {
+    if (synth) { return; }
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') { return; }
+    var p = pos(e);
+    var wasArmed = (state === 'armed' && five && five.id === e.pointerId);
+    var wasActive = (state === 'active' && drag && drag.id === e.pointerId);
 
     pointers.delete(e.pointerId);
 
-    if (pointers.size < 2) {
-      navActive = false;
-      nav.lastMid = null;
-      if (nav.raf) { cancelAnimationFrame(nav.raf); nav.raf = 0; }
-      nav.dx = 0;
-      nav.dy = 0;
-      pinchDist = null;
-    }
-  }
+    if (wasArmed) {
+      /* Tap: Penpot selects on a plain click. Prime hover (pointermove at
+         the exact point while the pointer is still active), then click. */
+      gl('UP tap @' + p.x + ',' + p.y);
+      dispatchPointer('pointermove', five.x, five.y, five.id);
+      dispatchMouse('click', five.x, five.y, 1);
 
-  function onPointerCancel(e) {
-    if (synthActive) { return; }
-    if (e.pointerType !== 'touch') { return; }
-    if (syn && e.pointerId === syn.id && syn.active) {
-      dispatchAt('pointercancel', e.clientX, e.clientY, syn.id);
-    }
-    onPointerUp(e);
-  }
-
-  // IME guard: if the soft keyboard opens (visualViewport resize) end any
-  // in-flight two-finger navigation so canvas coordinates never desync.
-  function onViewportResize() {
-    if (navActive) { onPointerUp({ pointerType: 'touch', pointerId: -1 }); }
-  }
-
-  function onContextMenu(e) {
-    if (insideViewport(e.target)) { e.preventDefault(); }
-  }
-
-  // Inject the touch hitbox + tap-highlight CSS overrides.
-  // NOTE: never widen the `.viewport-selrect` (the marquee itself): giving it
-  // an invisible stroke lets it re-catch pointers and spawn nested marquees
-  // anchored off the finger.
-  function injectCss() {
-    var css = [
-      '@media (pointer: coarse) {',
-      '  .viewport, [class$="__viewport"], [class$="__viewport"] * { -webkit-tap-highlight-color: transparent; }',
-      '  .viewport, [class$="__viewport"] { touch-action: none; }',
-      '  rect[data-position], circle[data-position] {',
-      '    pointer-events: stroke; stroke: transparent;',
-      '    stroke-width: 20px; vector-effect: non-scaling-stroke;',
-      '  }',
-      '}'
-    ].join('\n');
-    var style = document.createElement('style');
-    style.textContent = css;
-    document.head.appendChild(style);
-  }
-
-  function install() {
-    var opts = { capture: true, passive: false };
-    window.addEventListener('pointerdown', onPointerDown, opts);
-    window.addEventListener('pointermove', onPointerMove, opts);
-    window.addEventListener('pointerup', onPointerUp, opts);
-    window.addEventListener('pointercancel', onPointerCancel, opts);
-    window.addEventListener('contextmenu', onContextMenu, true);
-    var vv = window.visualViewport;
-    if (vv) { vv.addEventListener('resize', onViewportResize); }
-    injectCss();
-  }
-
-  // The canvas may not be mounted yet when we run (injected on page load).
-  // Some files take a while to open; keep polling for up to 30s.
-  function whenViewportReady() {
-    var tries = 0;
-    (function poll() {
-      if (viewportNode()) {
-        install();
-      } else if (tries++ < 100) {
-        setTimeout(poll, 300);
+      /* double-tap -> double-click -> edit */
+      var t = Date.now();
+      if (lastTap && (t - lastTap.t < TAP_MS) && dist(lastTap, five) < TAP_PX) {
+        gl('dbltap -> dblclick');
+        dispatchMouse('dblclick', five.x, five.y, 2);
+        lastTap = null;
+      } else {
+        lastTap = { x: five.x, y: five.y, t: t };
       }
-    })();
+      reset();
+    } else if (wasActive) {
+      /* Drag ended: send the up while the real pointer is still active. */
+      gl('UP drag @' + p.x + ',' + p.y);
+      dispatchPointer('pointerup', p.x, p.y, drag.id);
+      reset();
+    } else if (state === 'nav') {
+      if (pointers.size === 0) { reset(); }
+      gl('UP nav' + (pointers.size ? ' 1 remains' : ''));
+    } else {
+      gl('UP stray id=' + e.pointerId);
+    }
+    swallow(e);
   }
 
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    whenViewportReady();
-  } else {
-    document.addEventListener('DOMContentLoaded', whenViewportReady);
+  function onRealCancel(e) {
+    if (synth) { return; }
+    gl('CANCEL id=' + e.pointerId);
+    pointers.delete(e.pointerId);
+    if (state === 'active' && drag && drag.id === e.pointerId) {
+      dispatchPointer('pointercancel', drag.tx, drag.ty, drag.id);
+      reset();
+    } else {
+      reset();
+    }
   }
+
+  /* ------------------------------------------------------------------ */
+  /* 2-finger navigation (pinch zoom + pan)                              */
+  /* ------------------------------------------------------------------ */
+  function navMove() {
+    var pts = Array.from(pointers.values());
+    if (pts.length < 2) { return; }
+    var a = pts[0], b = pts[1];
+    var d = dist(a, b), m = mid(a, b);
+
+    /* pinch */
+    if (lastNav.d) {
+      var ratio = d / lastNav.d;
+      var dz = (ratio - 1) * ZOOM_SENS;
+      if (Math.abs(dz) > 0.5) {
+        dispatchMouseWheel(m.x, m.y, dz, 0, true);
+      }
+    }
+    /* pan (two fingers) */
+    if (lastNav.m) {
+      dispatchMouseWheel(m.x, m.y, -(m.x - lastNav.m.x) * 2, -(m.y - lastNav.m.y) * 2, false);
+    }
+    lastNav.d = d;
+    lastNav.m = m;
+  }
+
+  function dispatchMouseWheel(x, y, deltaY, deltaX, ctrl) {
+    var el = elementAt(x, y) || viewportNode();
+    if (!el) { return; }
+    try {
+      var ev = new WheelEvent('wheel', {
+        bubbles: true, cancelable: true, clientX: x, clientY: y,
+        deltaY: deltaY, deltaX: deltaX || 0, deltaMode: 0, ctrlKey: !!ctrl
+      });
+      synth = true;
+      try { el.dispatchEvent(ev); } finally { synth = false; }
+    } catch (err) { gl('wheel ERR ' + err.message); }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Helpers                                                               */
+  /* ------------------------------------------------------------------ */
+  function cancelArmed(why) {
+    if (five) { gl('cancel armed (' + why + ')'); five = null; }
+    state = 'idle';
+  }
+
+  function reset() {
+    five = null;
+    drag = null;
+    mode = null;
+    state = 'idle';
+    lastNav = {};
+    gl('reset -> idle');
+  }
+
+  function swallow(e) {
+    if (e.cancelable) { e.preventDefault(); }
+    e.stopImmediatePropagation();
+    e.stopPropagation();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Install                                                            */
+  /* ------------------------------------------------------------------ */
+  window.addEventListener('pointerdown', onRealDown, true);
+  window.addEventListener('pointermove', onRealMove, true);
+  window.addEventListener('pointerup', onRealUp, true);
+  window.addEventListener('pointercancel', onRealCancel, true);
+
+  /* Block native browser gestures (scroll/zoom/refresh-bounce) so every
+     event we care about is ours. */
+  document.addEventListener('touchstart', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
+  document.addEventListener('touchmove', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
+  document.addEventListener('touchend', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
+
+  var st = document.createElement('style');
+  st.textContent = 'html, body { touch-action: none !important; } .viewport, [class$="__viewport"] { touch-action: none !important; }';
+  document.head.appendChild(st);
+
+  gl('installed');
 })();
