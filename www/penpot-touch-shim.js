@@ -71,9 +71,14 @@
     // Fallback: the svg child of viewport
     return vp.querySelector('svg') || vp;
   }
+  function isCanvasViewport() {
+    // Only treat as canvas if viewport has the controls/render layer (editor page)
+    var vc = viewportControlsNode();
+    return !!(vc && (vc.querySelector('[class*="viewport-controls"]') || vc.tagName === 'SVG'));
+  }
   function insideViewport(node) {
     var vp = viewportNode();
-    return !!(node && vp && (node === vp || vp.contains(node)));
+    return !!(node && vp && (node === vp || vp.contains(node))) && isCanvasViewport();
   }
   function isEditable(node) {
     if (!node || !node.matches) { return false; }
@@ -367,12 +372,8 @@
   window.addEventListener('pointerup', onRealUp, true);
   window.addEventListener('pointercancel', onRealCancel, true);
 
-  document.addEventListener('touchstart', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
-  document.addEventListener('touchmove', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
-  document.addEventListener('touchend', function (e) { if (e.cancelable) e.preventDefault(); }, { passive: false, capture: true });
-
   var st = document.createElement('style');
-  st.textContent = 'html, body { touch-action: none !important; } .viewport, [class$="__viewport"] { touch-action: none !important; }';
+  st.textContent = '.viewport, [class$="__viewport"] { touch-action: none !important; }';
   document.head.appendChild(st);
 
   // Expose cleanup for re-injection
